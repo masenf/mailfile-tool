@@ -6,6 +6,7 @@
 
 import argparse
 import base64
+import difflib
 import logging
 import pwd
 import os
@@ -20,26 +21,186 @@ from subprocess import check_output
 #VALIASES = "/etc/postfix/virtual"
 #VMAILBOXES = "/etc/postfix/vmailbox"
 #MAINCF = "/etc/postfix/main.cf"
-VALIASES = "/root/pftest/virtual"
-VMAILBOXES = "/root/pftest/vmailbox"
-MAINCF = "/root/pftest/main.cf"
+VALIASES = "etc/postfix/virtual"
+VMAILBOXES = "etc/postfix/vmailbox"
+MAINCF = "etc/postfix/main.cf"
+DOVEADM = "./doveadm"
 
 # FILE / DIR FORMATS
-BACKUPS = "/root/pftest/backup"
-VMAILBASE = "/root/pftest/vhosts"
+BACKUPS = "etc/backup"
+VMAILBASE = "etc/vhosts"
 PASSWDFILE = "%(domain)s/passwd"
 HOMEDIR = "%(domain)s/%(user)s"
-USERLINE = "%(user)s:%(passwd)s:::"
+USERLINE = "{}:{}:::"
 
-def backup_file(fname):
-    basename = os.path.basename(fname)
-    dsuffix = time.strftime("%Y_%m_%d_%H%M%S")
-    try:
-        os.makedirs(BACKUPS)
-    except: pass
-    backup_path = os.path.join(BACKUPS, "{}.{}".format(basename, dsuffix))
-    shutil.copyfile(fname, backup_path)
-    logging.info("backed up %s to %s", fname, backup_path)
+class KeyValueFile(object):
+    open_files = {}
+    @classmethod
+    def open_file(cls, path, *args, **kwds):
+        """ create / fetch a global instance of KeyValueFile for the given path,
+            additional arguments will be passed to the constructor upon first
+            instantiation. If the file is already open, *args and **kwds will be
+            ignored. Typically use the same invocation parameters for a given file
+            anywhere that open_file is called"""
+        if path not in cls.open_files:
+            cls.open_files[path] = KeyValueFile(path, *args, **kwds)
+        return cls.open_files[path]
+    @classmethod
+    def commit_all(cls):
+        """ for each open file, write current changes and remove the instance
+            return True if all writes were successful"""
+        if not cls.open_files:
+            return True
+        dirty = [of for path, of in cls.open_files.iteritems() if of.dirty]
+        if dirty:
+            logging.info("saving changes to {} dirty files".format(len(dirty)))
+            results = [of.write() for of in dirty]
+            cls.open_files.clear()
+            return all(results)
+        return True
+    def __init__(self, path, comment_char="#", separator=None, backupdir=BACKUPS, lineformat="{:45} {}\n"):
+        self.fpath = path
+        self.k = {}
+        self.mods = []
+        self.comment_char = comment_char
+        self.separator = separator
+        self.backupdir = backupdir
+        self.lineformat = lineformat
+        self.dirty = False
+        self.refresh()
+    def __len__(self):
+        return len(self.get_valid_keys())
+    def __getitem__(self, key):
+        changes, new_keys = self.get_current_changes()
+        if key in changes:
+            if changes[key]:
+                return changes[key]
+            else:
+                raise KeyError("{} has been deleted from cache (not-persisted)".format(key))
+        return self.k[key]
+    def __setitem__(self, key, value):
+        logging.debug("caching %s --> %s", key, value)
+        self.dirty = True
+        self.mods.append((key, value))
+    def __delitem__(self, key):
+        self.__setitem__(key, None)
+    def __iter__(self):
+        return self.get_valid_keys().__iter__()
+    def refresh(self):
+        # create a non-existent file
+        if not os.path.exists(self.fpath):
+            with open(self.fpath, "w") as f: pass
+        with open(self.fpath, "r") as f:
+            self.lines = f.readlines()
+        self.k.clear()
+        for line in self.lines:
+            kv = self.parse_line(line)
+            if kv:
+                self.k[kv[0]] = kv[1]
+        logging.debug("refreshed from %s", self.fpath)
+    def get_valid_keys(self):
+        valid_keys = set(self.k.keys())
+        for k, val in self.mods:
+            if k in valid_keys:
+                if val:
+                    valid_keys.add(k)
+                else:
+                    valid_keys.remove(k)
+            elif val:
+                valid_keys.add(k)
+        return valid_keys
+    def get_current_changes(self):
+        changes = {}
+        new_keys = []
+        if self.dirty:
+            for k, val in self.mods:
+                # keep track of which keys need to be added
+                if k not in self.k and k not in new_keys:
+                    new_keys.append(k)
+                changes[k] = val
+                if val is None:
+                    try:
+                        # I guess keys could be added or removed in a single session
+                        # don't add new keys which later get removed, or something
+                        new_keys.remove(k)
+                    except ValueError: pass
+        return changes, new_keys
+    def write(self):
+        if not self.dirty:
+            logging.debug("no changes to write")
+            return True
+        modified = False
+        changes, new_keys = self.get_current_changes()
+        diff_in = []
+        diff_out = []
+        with tempfile.NamedTemporaryFile() as out:
+            logging.debug("opened file %s for writing", out.name)
+            with open(self.fpath, "r") as f:
+                logging.debug("opened file %s for reading", self.fpath)
+                try:
+                    for line in f:
+                        diff_in.append(line)
+                        kv = self.parse_line(line)
+                        if kv:       # we found an actual entry
+                            key, value = kv
+                            if key in changes:
+                                if changes[key]:
+                                    newline = self.lineformat.format(key, changes[key])
+                                    out.write(newline)
+                                    diff_out.append(newline)
+                                    logging.debug("update key: %s --> %s", key, changes[key])
+                                else:
+                                    logging.debug("remove key: %s", key)
+                                modified = True
+                                continue
+                        out.write(line)
+                        diff_out.append(line)
+                    for key in new_keys:
+                        # write new entries to file
+                        newline = self.lineformat.format(key, changes[key])
+                        out.write(newline)
+                        diff_out.append(newline)
+                        logging.debug("add key: %s --> %s", key, changes[key])
+                        modified = True
+                    out.flush()
+                except Exception, e:
+                    logging.error("encountered exception rewriting file (%s): %s", self.fpath, e)
+                    return False
+            if modified:
+                self.backup_file(self.fpath)
+                logging.info("updating disk file, diff:\n\t\t%s", "\t\t".join(difflib.unified_diff(diff_in, diff_out, fromfile=self.fpath, tofile=out.name)))
+                shutil.copyfile(out.name, self.fpath)
+            else:
+                logging.debug("%s was not modified", self.fpath)
+        self.mods = []
+        self.dirty = False
+        self.refresh()
+        return True
+    def parse_line(self, line):
+        # remove comments from the line
+        cmt = line.find(self.comment_char)
+        if cmt > -1:
+            line = line[:cmt].strip()
+        value = line.strip()
+
+        if value:
+            try:
+                key, value = value.split(self.separator, 1)
+                logging.debug("parsed entry: %s --> %s", key, value)
+                return key.strip(), value.strip()
+            except Exception, e:
+                logging.warning("couldn't parse line: %s,\n%s", line, e)
+        return None
+    def backup_file(self, fname):
+        basename = os.path.basename(fname)
+        dsuffix = time.strftime("%Y_%m_%d_%H%M%S")
+        try:
+            os.makedirs(self.backupdir)
+        except: pass
+        backup_path = os.path.join(self.backupdir, "{}.{}".format(basename, dsuffix))
+        shutil.copyfile(fname, backup_path)
+        logging.info("backed up %s to %s", fname, backup_path)
+
 def setup_logging(str_level):
     """process the default parser arguments"""
     logfmt = "%(levelname)7s %(funcName)-32s %(message)s"
@@ -78,85 +239,52 @@ def is_local_delivery(target):
 def alias(args):
     """process the alias sub command"""
     if args.list:
-        aliases = get_aliases()
+        aliases = get_aliases(args.domain)
         print("\n".join(["{:45} {}".format(*a) for a in aliases]))
         return True
     elif args.add:
         return add_alias(*args.add)
     elif args.rm:
-        return rm_alias(~args.rm)
+        return rm_alias(*args.rm)
     return False
-def parse_keyvalue_line(line):
-    """ take a line from the alias file and return a tuple of (key, value) or None """
-    # remove comments from the line
-    cmt = line.find("#")
-    if cmt > -1:
-        line = line[:cmt].strip()
-    value = line.strip()
-
-    if value:
-        try:
-            key, value = value.split()
-            logging.debug("parsed entry: %s --> %s", key, value)
-            return key, value
-        except Exception, e:
-            logging.warning("couldn't parse line: %s,\n%s", line, e)
-    return None
 def get_aliases(domain=""):
     """ return a list of tuples specify addr -> target """
-    with open(VALIASES, "r") as va:
-        logging.debug("opened file %s for reading", VALIASES)
-        return [alias for alias in 
-                   [parse_keyvalue_line(line) for line in va] 
-                if alias is not None and alias[0].endswith(domain)]
+    aliases = KeyValueFile.open_file(VALIASES)
+    laliases = sorted([a for a in aliases.get_valid_keys() if a.endswith(domain)])
+    return [(a, aliases[a]) for a in laliases]
+
 def add_alias(addr, target):
-    daliases = dict(get_aliases())
-
+    aliases = KeyValueFile.open_file(VALIASES)
+    # ensure valid form
+    try:
+        user, domain = addr.split("@",1)
+    except KeyError:
+        logging.error("%s must be an email address", addr)
+        return False
     # see if the alias already exists
-    if addr in daliases:
-        logging.error("%s is already an alias to %s", addr, daliases[addr])
+    if addr in aliases:
+        logging.error("%s is already an alias to %s", addr, aliases[addr])
         return False
-    if not is_local_delivery(target) and not args.remote:
-        logging.error("target %s is remote, specify --remote to add anyway", target)
+    # check for remote delivery
+    if not args.remote and not is_local_delivery(target):
+        logging.warning("target %s is remote, specify --remote to add anyway", target)
+        return False
+    # ensure that the requested address is hosted here
+    alias_domains, mailbox_domains = get_domains()
+    if domain not in alias_domains + mailbox_domains:
+        logging.error("%s must be a domain hosted here", addr)
         return False
 
-    backup_file(VALIASES)
-    with open(VALIASES, "a") as va:
-        logging.debug("opened file %s for append", VALIASES)
-        va.write("{:45} {}\n".format(addr, target))
-    logging.info("successfully added alias %s --> %s", addr, target)
+    aliases[addr] = target
     return True
+
 def rm_alias(addr):
-    return rm_key_from_file(VALIASES, addr)
-def rm_key_from_file(fname, key):
-    found = False
-    with tempfile.NamedTemporaryFile() as out:
-        logging.debug("opened file %s for writing", out.name)
-        with open(fname, "r") as f:
-            logging.debug("opened file %s for reading", fname)
-            try:
-                for line in f:
-                    kv = parse_keyvalue_line(line)
-                    if kv is not None:
-                        if kv[0] == key:
-                            logging.debug("found line to delete: %s", line.strip())
-                            found = True
-                            continue
-                    out.write(line)
-                out.flush()
-            except Exception, e:
-                logging.debug("encountered exception reading file (%s): %s", fname, e)
-                return False
-        if found:
-            backup_file(fname)
-            shutil.copyfile(out.name, fname)
-        else:
-            logging.info("%s was not found in file (%s)", key, fname)
+    aliases = KeyValueFile.open_file(VALIASES)
+    del aliases[addr]
     return True
 
 def mailbox(args):
     """process the mailbox sub command"""
-    print("Mailbox parser")
     if args.list:
         mailboxes = get_mailboxes(args.domain)
         print("\n".join(["{}@{}".format(*mb) for mb in mailboxes]))
@@ -177,23 +305,35 @@ def mailbox(args):
     return False
 def get_mailboxes(domain=None):
     """ return a list of virtual mailbox tuples (user, domain) """
-    with open(VMAILBOXES, "r") as vm:
-        logging.debug("opened file %s for reading", VMAILBOXES)
-        allboxes = [mb for mb in 
-                       [parse_keyvalue_line(line) for line in vm]
-                    if mb is not None]
-        mailboxes = [mb[0].strip().split("@") for mb in allboxes]
-        if domain:
-            return filter(lambda mb: mb[1] == domain, mailboxes)
-        return mailboxes
+    vmailboxes = KeyValueFile.open_file(VMAILBOXES)
+    mailboxes = [addr.split("@") for addr in vmailboxes.get_valid_keys()]
+    if domain:
+        return filter(lambda mb: mb[1] == domain, mailboxes)
+    return mailboxes
 def add_mailbox(user, domain):
+    addr = "{}@{}".format(user, domain)
+
+    # ensure that the requested address is hosted here
+    alias_domains, mailbox_domains = get_domains()
+    if domain not in mailbox_domains:
+        if domain in alias_domains:
+            logging.error("%s is a virtual alias domain, cannot create virtual mailbox", domain)
+        else:
+            logging.error("%s must be hosted here to create virtual mailbox", domain)
+        return False
+
     mailboxes = get_mailboxes(domain)
+    aliases = get_aliases(domain)
     users = [u for u,d in mailboxes]
 
-    # see if the alias already exists
+    # see if the mailbox already exists
     if user in users:
-        logging.error("%s@%s is already a virtual mailbox", user, domain)
+        logging.error("%s is already a virtual mailbox", addr)
         return False
+    for a in aliases:
+        if a[0] == addr:
+            logging.error("%s is already a virtual alias to %s", addr, a[1])
+            return False
     home_dir_suff = HOMEDIR % {"user": user, "domain": domain}
     home_dir = os.path.join(VMAILBASE, home_dir_suff)
     delivery_dir_suff = os.path.join(home_dir_suff, "Maildir/")
@@ -205,24 +345,19 @@ def add_mailbox(user, domain):
         return False
     os.makedirs(delivery_dir)
 
-    backup_file(VMAILBOXES)
-    with open(VMAILBOXES, "a") as vm:
-        logging.debug("opened file %s for append", VMAILBOXES)
-        vm.write("{}@{:45} {}\n".format(user, domain, delivery_dir_suff))
-    logging.info("successfully added mailbox %s@%s --> %s", user, domain, delivery_dir_suff)
+    vmailboxes = KeyValueFile.open_file(VMAILBOXES)
+    vmailboxes[addr] = delivery_dir_suff
+    logging.debug("added mailbox %s --> %s", addr, delivery_dir_suff)
     randompass = base64.b64encode(os.urandom(6))
     if not update_user(user, domain, dc_crypt(randompass)):
         return False
-    print("Add mailbox: {}@{} with password {}".format(user, domain, randompass))
+    print("Add mailbox: {} with password {}".format(addr, randompass))
     return True
 def rm_mailbox(user, domain):
     success = True
     addr = "{}@{}".format(user, domain)
-    if rm_key_from_file(VMAILBOXES, addr):
-        logging.debug("removed %s from virtual mail delivery", addr)
-    else:
-        logging.error("could not remove %s, check debug logging", addr)
-        success = False
+    vmailboxes = KeyValueFile.open_file(VMAILBOXES)
+    del vmailboxes[addr]
 
     home_dir_suff = HOMEDIR % {"user": user, "domain": domain}
     home_dir = os.path.join(VMAILBASE, home_dir_suff)
@@ -239,12 +374,12 @@ def rm_mailbox(user, domain):
     aliases = get_aliases()
     for alias in aliases:
         if alias[1] == addr:
-            logging.info("also removing stale alias %s --> %s", alias[0], alias[1])
+            logging.info("remove dangling alias %s --> %s", alias[0], alias[1])
             rm_alias(alias[0])
     return success
     
 def dc_crypt(password=None):
-    cmd = ["doveadm", "pw", "-s", "SHA512-CRYPT"]
+    cmd = [DOVEADM, "pw", "-s", "SHA512-CRYPT"]
     logging.debug("shelling out to doveadm for password hashing")
     if password:
         cmd += ["-p", password]
@@ -253,46 +388,8 @@ def update_user(user, domain, password=None):
     """ create/update user record. if password is None, the user is 
         removed. Password should already be SHA512-CRYPT'd """
     passwdf = os.path.join(VMAILBASE, PASSWDFILE % {"domain": domain})
-    found = False
-    modified = False
-    with tempfile.NamedTemporaryFile() as out:
-        logging.debug("opened file %s for writing", out.name)
-        if not os.path.exists(passwdf):
-            logging.debug("creating non-existent password file: %s", passwdf)
-            with open(passwdf, "w") as pf: pass
-        with open(passwdf, "r") as pf:
-            logging.debug("opened file %s for reading", passwdf)
-            try:
-                for line in pf:
-                    luser, rest = line.split(":",1)
-                    if user == luser:
-                        logging.debug("found user: %s", user)
-                        found = True
-                        if password:
-                            # update the user record
-                            out.write(USERLINE % {"user": user, "passwd": password})
-                            out.write("\n")
-                            logging.info("update user record for: %s@%s", user, domain)
-                        else:
-                            # delete the user record by not copying the line
-                            logging.info("remove user record for: %s@%s", user, domain)
-                        modified = True
-                        continue
-                    out.write(line)
-                if not found and password:
-                    out.write(USERLINE % {"user": user, "passwd": password})
-                    out.write("\n")
-                    modified = True
-                    logging.info("add user record for: %s@%s", user, domain)
-                out.flush()
-            except Exception, e:
-                logging.error("encountered exception reading passwd-file (%s): %s", passwdf, e)
-                return False
-        if modified:
-            backup_file(passwdf)
-            shutil.copyfile(out.name, passwdf)
-        else:
-            logging.info("%s was not found in file", user)
+    passwdb = KeyValueFile.open_file(passwdf, separator=":", lineformat=USERLINE+"\n")
+    passwdb[user] = password
     return True
 def domain(args):
     """process the domain sub command"""
@@ -300,60 +397,28 @@ def domain(args):
         alias_domains, mailbox_domains = get_domains()
         print("\n".join(["a:{}".format(a) for a in alias_domains]))
         print("\n".join(["m:{}".format(m) for m in mailbox_domains]))
+        return True
     elif args.rm:
-        rm_domain(args.rm[0])
+        return rm_domain(args.rm[0])
     elif args.valias:
-        add_domain(args.valias[0], "alias")
+        return add_domain(args.valias[0], "alias")
     elif args.vmailbox:
-        add_domain(args.vmailbox[0], "mailbox")
+        return add_domain(args.vmailbox[0], "mailbox")
     return False
 def get_domains():
     """get all virtual alias and virtual mailbox domains in a tuple of list"""
     alias_domains = []
     mailbox_domains = []
-    with open(MAINCF, "r") as mc:
-        logging.debug("opened file %s for reading", MAINCF)
-        for line in mc:
-            line = line.strip()
-            if line.startswith("virtual_alias_domains"):
-                key, value = line.split("=")
-                alias_domains.extend([v.strip() for v in value.split(",")])
-            elif line.startswith("virtual_mailbox_domains"):
-                key, value = line.split("=")
-                mailbox_domains.extend([v.strip() for v in value.split(",")])
+    mc = KeyValueFile.open_file(MAINCF, separator="=", lineformat="{} = {}\n")
+
+    if "virtual_alias_domains" in mc:
+        alias_domains.extend([v.strip() for v in mc["virtual_alias_domains"].split(",")])
+    if "virtual_mailbox_domains" in mc:
+        mailbox_domains.extend([v.strip() for v in mc["virtual_mailbox_domains"].split(",")])
     return alias_domains, mailbox_domains
 def update_main_cf(key, value):
-    found = False
-    with tempfile.NamedTemporaryFile() as out:
-        logging.debug("opened file %s for writing", out.name)
-        with open(MAINCF, "r") as mc:
-            logging.debug("opened file %s for reading", MAINCF)
-            try:
-                for line in mc:
-                    sline = line.strip()
-                    if sline.startswith(key):
-                        k, v = sline.split("=")
-                        if k.strip() == key:
-                            found = True
-                            if value:
-                                out.write("{} = {}\n".format(key, value))
-                                logging.info("updating %s = %s", key, value)
-                        modified = True
-                        continue
-                    out.write(line)
-                if not found and value:
-                    out.write("{} = {}\n".format(key, value))
-                    modified = True
-                    logging.info("adding %s = %s", key, value)
-                out.flush()
-            except Exception, e:
-                logging.error("encountered exception updating main.cf (%s): %s", MAINCF, e)
-                return False
-        if modified:
-            backup_file(MAINCF)
-            shutil.copyfile(out.name, MAINCF)
-        else:
-            logging.info("%s was not found in file", user)
+    mc = KeyValueFile.open_file(MAINCF, separator="=", lineformat="{} = {}\n")
+    mc[key] = value
     return True
 def add_domain(domain, style="mailbox"):
     style = style.lower()
@@ -379,13 +444,18 @@ def rm_domain(domain):
     if domain in alias_domains:
         alias_domains.remove(domain)
         for alias in get_aliases(domain):
+            logging.info("remove undeliverable alias %s --> %s", *alias)
             rm_alias(alias[0])
         update_main_cf("virtual_alias_domains", ", ".join(alias_domains))
         logging.info("removed virtual alias domain %s", domain)
     elif domain in mailbox_domains:
         mailbox_domains.remove(domain)
         for mb in get_mailboxes(domain):
+            logging.info("remove undeliverable mailbox %s@%s", *mb)
             rm_mailbox(*mb)
+        for alias in get_aliases(domain):
+            logging.info("remove undeliverable alias %s --> %s", *alias)
+            rm_alias(alias[0])
         update_main_cf("virtual_mailbox_domains", ", ".join(mailbox_domains))
         logging.info("removed virtual mailbox domain %s", domain)
     else:
@@ -396,7 +466,7 @@ def rm_domain(domain):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(help="Select an object to modify from the list")
-    parser.add_argument("--level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO",
+    parser.add_argument("--level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="WARNING",
                         help="set the logging verbosity level")
 
     p_alias = subparsers.add_parser("alias", help="Operate on virtual alias entries")
@@ -408,6 +478,7 @@ if __name__ == '__main__':
     a_mexg.add_argument("--rm", "-r", nargs=1, metavar="ADDR",
                         help="remove ADDR from the virtual alias table")
     p_alias.add_argument("--remote", action='store_true', help="allow remote TARGET for alias creation")
+    p_alias.add_argument("--domain", "-d", help="restrict listing to DOMAIN")
 
     p_mailbox = subparsers.add_parser("mailbox", help="Operate on virtual mailbox entries")
     p_mailbox.set_defaults(func=mailbox)
@@ -419,7 +490,7 @@ if __name__ == '__main__':
                         help="remove virtual mailbox ADDR")
     m_mexg.add_argument("--passwd", "-p", nargs=1, metavar="ADDR",
                         help="Reset IMAP/SMTP password for ADDR") 
-    p_mailbox.add_argument("--domain", "-d", action='store_true', help="restrict listing to DOMAIN")
+    p_mailbox.add_argument("--domain", "-d", help="restrict listing to DOMAIN")
 
     p_domain = subparsers.add_parser("domain", help="Add or remove hosted domains")
     p_domain.set_defaults(func=domain)
@@ -434,4 +505,6 @@ if __name__ == '__main__':
 
     args = parser.parse_args(sys.argv[1:])
     setup_logging(args.level)
-    sys.exit(not args.func(args))
+    if args.func(args):
+        sys.exit(KeyValueFile.commit_all())
+    sys.exit(1)
