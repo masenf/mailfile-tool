@@ -15,21 +15,24 @@ import shutil
 import sys
 import tempfile
 import time
-from subprocess import check_output
+from subprocess import check_output, check_call
 
 # DEFAULT PATHS LOCATIONS
-#VALIASES = "/etc/postfix/virtual"
-#VMAILBOXES = "/etc/postfix/vmailbox"
-#MAINCF = "/etc/postfix/main.cf"
-VALIASES = "etc/postfix/virtual"
-VMAILBOXES = "etc/postfix/vmailbox"
-MAINCF = "etc/postfix/main.cf"
-DOVEADM = "./doveadm"
+VALIASES = "/etc/postfix/virtual"
+VMAILBOXES = "/etc/postfix/vmailbox"
+MAINCF = "/etc/postfix/main.cf"
+#VALIASES = "etc/postfix/virtual"
+#VMAILBOXES = "etc/postfix/vmailbox"
+#MAINCF = "etc/postfix/main.cf"
+DOVEADM = "/usr/bin/doveadm"
+SCHEME = "SSHA512"
+POSTMAP = "/usr/bin/postmap"
+POSTFIX = "/usr/bin/postfix"
 
 # FILE / DIR FORMATS
-BACKUPS = "etc/backup"
-VMAILBASE = "etc/vhosts"
-PASSWDFILE = "%(domain)s/passwd"
+BACKUPS = "/root/postfix/backup"
+VMAILBASE = "/var/vmail/vhosts"
+PASSWDFILE = "/etc/dovecot/auth/%(domain)s.passwd"
 HOMEDIR = "%(domain)s/%(user)s"
 USERLINE = "{}:{}:::"
 
@@ -48,16 +51,19 @@ class KeyValueFile(object):
     @classmethod
     def commit_all(cls):
         """ for each open file, write current changes and remove the instance
-            return True if all writes were successful"""
+            return (written, dirty, clean) each is a bare number"""
         if not cls.open_files:
-            return True
-        dirty = [of for path, of in cls.open_files.iteritems() if of.dirty]
-        if dirty:
-            logging.info("saving changes to {} dirty files".format(len(dirty)))
-            results = [of.write() for of in dirty]
+            return (0, 0, 0)
+        dirtylist = [of for path, of in cls.open_files.iteritems() if of.dirty]
+        written = 0
+        dirty = len(dirtylist)
+        clean = len(cls.open_files) - dirty
+        if dirtylist:
+            results = [of.write() for of in dirtylist]
+            written = results.count(True)
             cls.open_files.clear()
-            return all(results)
-        return True
+        logging.info("successfully write {} of {} dirty files".format(written, dirty))
+        return (written, dirty, clean)
     def __init__(self, path, comment_char="#", separator=None, backupdir=BACKUPS, lineformat="{:45} {}\n"):
         self.fpath = path
         self.k = {}
@@ -206,6 +212,14 @@ def setup_logging(str_level):
     logfmt = "%(levelname)7s %(funcName)-32s %(message)s"
     logging.basicConfig(format=logfmt, level=getattr(logging, str_level))
     logging.debug("logging initialized")
+def postfix_refresh():
+    commands = [ [ POSTMAP, VALIASES ],
+                 [ POSTMAP, VMAILBOXES ],
+                 [ POSTFIX, "reload" ] ]
+    for cmd in commands:
+        logging.debug("shelling out to {}".format(" ".join(cmd)))
+        check_call(cmd)
+    logging.info("postfix refreshed and ready")
 def is_local_delivery(target):
     """ return true if target identifies an address for local delivery:
             1) unix system account
@@ -298,8 +312,8 @@ def mailbox(args):
     elif args.passwd:
         user, domain = args.passwd[0].split("@",1)
         new_password = dc_crypt()
-        if new_password.startswith("{SHA512-CRYPT}"):
-            return update_user(user, domain, dc_crypt())
+        if new_password.startswith("{{{}}}".format(SCHEME)):
+            return update_user(user, domain, new_password)
         else:
             logging.error("Password hash should be in SHA512-CRYPT format, command returned: %s", new_password)
     return False
@@ -344,6 +358,7 @@ def add_mailbox(user, domain):
                         "manually inspect and remove %s to continue", home_dir)
         return False
     os.makedirs(delivery_dir)
+    check_call(["chown", "-R", "vmail:vmail", home_dir])
 
     vmailboxes = KeyValueFile.open_file(VMAILBOXES)
     vmailboxes[addr] = delivery_dir_suff
@@ -379,7 +394,7 @@ def rm_mailbox(user, domain):
     return success
     
 def dc_crypt(password=None):
-    cmd = [DOVEADM, "pw", "-s", "SHA512-CRYPT"]
+    cmd = [DOVEADM, "pw", "-s", SCHEME]
     logging.debug("shelling out to doveadm for password hashing")
     if password:
         cmd += ["-p", password]
@@ -387,7 +402,7 @@ def dc_crypt(password=None):
 def update_user(user, domain, password=None):
     """ create/update user record. if password is None, the user is 
         removed. Password should already be SHA512-CRYPT'd """
-    passwdf = os.path.join(VMAILBASE, PASSWDFILE % {"domain": domain})
+    passwdf = PASSWDFILE % {"domain": domain}
     passwdb = KeyValueFile.open_file(passwdf, separator=":", lineformat=USERLINE+"\n")
     passwdb[user] = password
     return True
@@ -478,7 +493,8 @@ if __name__ == '__main__':
     a_mexg.add_argument("--rm", "-r", nargs=1, metavar="ADDR",
                         help="remove ADDR from the virtual alias table")
     p_alias.add_argument("--remote", action='store_true', help="allow remote TARGET for alias creation")
-    p_alias.add_argument("--domain", "-d", help="restrict listing to DOMAIN")
+    p_alias.add_argument("--domain", "-d", default='', 
+                        help="restrict listing to DOMAIN")
 
     p_mailbox = subparsers.add_parser("mailbox", help="Operate on virtual mailbox entries")
     p_mailbox.set_defaults(func=mailbox)
@@ -490,7 +506,8 @@ if __name__ == '__main__':
                         help="remove virtual mailbox ADDR")
     m_mexg.add_argument("--passwd", "-p", nargs=1, metavar="ADDR",
                         help="Reset IMAP/SMTP password for ADDR") 
-    p_mailbox.add_argument("--domain", "-d", help="restrict listing to DOMAIN")
+    p_mailbox.add_argument("--domain", "-d", default="",
+                        help="restrict listing to DOMAIN")
 
     p_domain = subparsers.add_parser("domain", help="Add or remove hosted domains")
     p_domain.set_defaults(func=domain)
@@ -506,5 +523,8 @@ if __name__ == '__main__':
     args = parser.parse_args(sys.argv[1:])
     setup_logging(args.level)
     if args.func(args):
-        sys.exit(KeyValueFile.commit_all())
+        written, dirty, clean = KeyValueFile.commit_all()
+        if written > 0:
+            postfix_refresh()
+        sys.exit(dirty - written)    # 0 if all dirty files were written to disk
     sys.exit(1)
